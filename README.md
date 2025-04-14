@@ -35,6 +35,8 @@ Each model is trained using early stopping and learning rate scheduling. Test pe
 bash run_modeling.sh
 ```
 
+---
+
 ### Metadata Format and Embedding Structure
 
 The script `embedding.py` produces a metadata CSV file named `patient_embedding_metadata.csv`. Each row in the file corresponds to a single patient-day pair and contains the following fields:
