@@ -1,5 +1,5 @@
 #!/bin/bash
-python embedding.py \
+python embeddings.py \
   --csv patients_subset_100.csv \
   --icd icd_mapping.csv \
   --output_dir ckd_embeddings_100 \
