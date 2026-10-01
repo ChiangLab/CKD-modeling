@@ -1,176 +1,253 @@
 #!/usr/bin/env python
+# Formerly embedding_gen_pl.py (original in _original/embedding_gen_pl.py).
+"""Generate encounter-level clinical pseudo-notes and ClinicalBERT embeddings.
+
+Steps:
+  1. Cohort: patients with at least one CKD ICD-10 code N18.x whose maximum
+     recorded stage is >= 3 (N18.1-N18.5 -> 1-5, N18.6 (ESRD) -> 6,
+     N18.9 (unspecified) -> 0). Events with a null ``DataNumeric`` are dropped.
+  2. Each event becomes a clause:
+       Diagnosis   -> " - ICD-10 code N18.3: <ICD long title>"
+                      (codes without an ICD-10 title, mostly ICD-9, are dropped)
+       Medications -> " - Medication administered: <name>"
+       Procedure   -> " - Procedure performed: <name>"
+       Labs        -> " - <lab name>: <value>"
+     Demographics/Encounter rows are not turned into clauses.
+  3. Clauses are joined per day ("On <date>, the patient had the following
+     records: ..."), and days are joined per encounter (META_1) into one
+     pseudo-note prefixed with "Encounter <id> starting <date>." and a
+     demographic sentence ("Patient <id>, born <DOB> is a <race> <sex>.").
+  4. Each pseudo-note is encoded separately with ClinicalBERT (truncated to 512
+     tokens); the CLS vector of the last hidden layer is the embedding.
+
+Outputs in ``output_dir``:
+  * ``meta_v3_all.csv`` -- '$'-separated metadata incl. the note text (enc_summary).
+  * ``meta_v3.csv`` -- same without the note text; read by ckd_prediction.py.
+    Columns: PatientID, META_1, date, enc_id, emb_id, CKD_stage_numeric, max_stage.
+  * ``<PatientID>/<PatientID>.npy`` -- one row per metadata row of the patient,
+    ordered by emb_id (encounter date order).
+"""
+
 import os
-import argparse
 import pandas as pd
+import polars as pl
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
-from datetime import datetime
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Generate synthetic patient-day notes, map GFR to CKD stages, and generate embeddings using a transformer model."
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+cuda_num = 2
+print(f"cuda:{str(cuda_num)}")
+
+icd_file = "/opt/data/commonfilesharePHI/ldiao/ckd_project/icd_mapping.csv"
+demographic_file = '/opt/data/commonfilesharePHI/jnchiang/projects/OptumCKD/CKD-supplemental_pull.rpt'
+
+output_dir = "/opt/data/commonfilesharePHI/jnchiang/projects/OptumCKD/ckd_embedding_full_v3"
+event_file = "/opt/data/commonfilesharePHI/jnchiang/projects/OptumCKD/CKD-Pull_v3.rpt.parquet"
+
+output_dir += "_icd"  # notes include ICD-10 long titles
+
+filter_ckd_stage = True  # only tags the output dir; the stage >= 3 filter below always applies
+if filter_ckd_stage:
+    output_dir += "_stage_filter"
+
+print(output_dir)
+
+csv = event_file
+icd = icd_file
+model_name = "/opt/data/commonfilesharePHI/slee/MEME/clinicalBERT-emily"  # local copy of ClinicalBERT
+embed_dim = 768
+
+os.makedirs(output_dir, exist_ok=True)
+
+# ----------------------------------------------------------------------------
+# ICD-10 code -> long title (codes stored without the dot)
+# ----------------------------------------------------------------------------
+icd_df = pd.read_csv(icd)
+icd_df["icd_code"] = icd_df["icd_code"].astype(str).str.replace(".", "", regex=False)
+icd_map = dict(zip(icd_df["icd_code"], icd_df["long_title"]))
+
+# ----------------------------------------------------------------------------
+# Cohort: patients whose max CKD stage (from N18.x codes) is >= 3
+# ----------------------------------------------------------------------------
+df = pl.read_parquet(csv)
+
+custom_map = {
+    1: 1,
+    2: 2,
+    3: 3,
+    4: 4,
+    5: 5,
+    6: 6,  # ESRD
+    9: 0,  # CKD, unspecified stage
+}
+print("Building Filter")
+ckd_icd_df = (
+    df.filter(pl.col("DataCategory").str.contains("N18"))
+    .with_columns(
+      pl.col("DataCategory")
+        .str.extract(r"N18\.([1-9])", 1)
+        .cast(pl.Int64)
+        .replace(custom_map, default=None)
+        .alias("CKD_stage_numeric")
     )
-    parser.add_argument("--csv", type=str, default="patients_subset_100.csv",
-                        help="Path to the main event CSV file.")
-    parser.add_argument("--icd", type=str, default="icd_mapping.csv",
-                        help="Path to the ICD mapping CSV file.")
-    parser.add_argument("--output_dir", type=str, default="ckd_embeddings_100",
-                        help="Directory in which to save the generated embeddings and metadata.")
-    parser.add_argument("--model_name", type=str, default="/home2/simlee/share/slee/GeneratEHR/clinicalBERT-emily",
-                        help="Pretrained transformer model to use for embeddings.")
-    parser.add_argument("--embed_dim", type=int, default=768,
-                        help="Dimension to which the model embedding should be truncated or padded.")
-    parser.add_argument("--batch_size", type=int, default=128,
-                        help="Batch size for encoding the synthetic notes.")
-    return parser.parse_args()
-
-def load_data(csv_path, icd_path):
-    print(f"[INFO] Loading patient events from: {csv_path}")
-    # Set low_memory to False to suppress dtype warnings for mixed types.
-    df = pd.read_csv(csv_path, low_memory=False)
-    df = df.drop_duplicates()
-    icd_df = pd.read_csv(icd_path)
-
-    df['DataCategory'] = df['DataCategory'].fillna('None')
-    df['DataNumeric'] = df['DataNumeric'].fillna('None')
-    df['EventTimeStamp'] = pd.to_datetime(df['EventTimeStamp'], errors='coerce')
-    df['EventDate'] = df['EventTimeStamp'].dt.date
-    df['is_gfr'] = df['DataCategory'].str.upper().str.contains('GFR|GFREST', na=False)
-
-    icd_df["icd_code"] = icd_df["icd_code"].astype(str).str.replace(".", "", regex=False)
-    icd_map = dict(zip(icd_df["icd_code"], icd_df["long_title"]))
-    return df, icd_map
-
-def format_demographics(row):
-    # When grouping by PatientID without resetting index, PatientID is in row.name.
-    pid = row.name
-    race_ethnicity = str(row["DataCategory"]).replace("//", " ").replace("/", " ")
-    if "Unknown Not Reported" in race_ethnicity:
-        race_ethnicity = race_ethnicity.replace("Unknown Not Reported", "").strip()
-    if "Do not identify with Race" in race_ethnicity:
-        race_ethnicity = race_ethnicity.replace("Do not identify with Race", "unknown race").strip()
-    return f"Patient {pid} is a {race_ethnicity} patient."
-
-def build_demographic_map(df):
-    demographics = df[df["DataType"] == "Demographics"].dropna(subset=["DataCategory"])
-    demographic_map = (
-        demographics.groupby("PatientID")
-        .first()
-        .apply(format_demographics, axis=1)
-        .to_dict()
+    .select([pl.col("PatientID"), pl.col("EventTimeStamp"), pl.col("META_1"), pl.col("CKD_stage_numeric")])
+    .with_columns(
+        pl.col("CKD_stage_numeric")
+            .max()
+            .over("PatientID")
+            .alias("max_stage")
     )
-    return demographic_map
+    .filter(pl.col("max_stage") >= 3)
+    .unique()
+)
+print("Filtering and converting")
 
-def generate_synthetic_notes(df, demographic_map, icd_map):
-    events = df[df["DataType"] != "Demographics"].copy()
-    grouped = events.groupby(['PatientID', 'EventDate'])
-    records = []
+# Keep cohort events; parse timestamps; fall back to META_2 for missing categories.
+df = (
+    df
+    .join(
+        ckd_icd_df.select("PatientID").unique(),
+        on="PatientID",
+        how='inner')
+    .drop_nulls(subset=["DataNumeric"])
+    .with_columns([
+        pl.col("EventTimeStamp").str.strptime(pl.Datetime("us"))
+        , pl.col("DataCategory").fill_null(pl.col("META_2"))
+    ])
+    .with_columns(
+        pl.col("EventTimeStamp").dt.date().alias("EventDate")
+    )
+)
 
-    for (pid, date), group in tqdm(grouped, desc="Formatting synthetic notes"):
-        note_lines = []
-        gfr = None
+# ----------------------------------------------------------------------------
+# Demographic sentence per patient
+# ----------------------------------------------------------------------------
+demographic_df = (
+    pl.read_csv(demographic_file, separator='$')
+    .with_columns(
+        pl.format(
+            "Patient {}, born {} is a {} {}."
+            , pl.col("PatientID")
+            , pl.col("DOB")
+            , pl.col("EthnoRacialCategory")
+                .replace("*No Usable Values", "Unknown Race")
+                .replace("Multiple Ethnoracial Categories", "Multiracial")
+            , pl.col("Sex")
+        ).alias("sentence")
+    )
+)
+demographic_map = dict(zip(demographic_df["PatientID"], demographic_df["sentence"]))
 
-        if pid in demographic_map:
-            note_lines.append(demographic_map[pid])
-        else:
-            note_lines.append(f"Patient {pid} demographics information not available.")
+# ----------------------------------------------------------------------------
+# Clinical events -> clauses
+# ----------------------------------------------------------------------------
+sentences_df = (
+    df.filter(~pl.col("DataType").is_in(["Demographics", "Encounter"]))
+    .with_columns(
+        pl.when(pl.col("DataType") == "Diagnosis").then(
+            pl.col("DataCategory")
+                .str.replace(".", "", literal=True)
+                .replace(icd_map, default="Unknown")
+        ).otherwise(pl.format("NA"))
+        .alias("long_title")
+        , pl.when((pl.col("DataType") == "Encounter") &
+                (pl.col("DataCategory").str.contains("//"))).then(
+            pl.col("DataCategory").str.replace("//", ": ")
+        ).otherwise(pl.format("NA"))
+        .alias("EncounterType")
+    )
+    .filter(pl.col("long_title") != "Unknown")  # diagnoses without an ICD-10 title (mostly ICD-9)
+    .with_columns(
+        pl.when(pl.col("DataType") == "Diagnosis").then(
+            pl.format(" - ICD-10 code {}: {}", pl.col("DataCategory"), pl.col("long_title"))
+        )
+        .when(pl.col("DataType") == "Medications").then(
+            pl.format(" - Medication administered: {}", pl.col("DataCategory"))
+        )
+        .when(pl.col("DataType") == "Procedure").then(
+            pl.format(" - Procedure performed: {}", pl.col("DataCategory"))
+        )
+        .when(pl.col("DataType") == "Labs").then(
+            pl.format(" - {}: {}", pl.col("DataCategory"), pl.col("DataNumeric"))
+        )
+        .when(pl.col("DataType") == "Encounter").then(
+            pl.when(pl.col("EncounterType") != "NA").then(
+                pl.format(" - {}", pl.col("DataCategory"))
+            ).otherwise(
+                pl.format(" - {}: {}", pl.col("DataCategory"), pl.col("DataNumeric"))
+            )
+        )
+        .otherwise(pl.format("Not parsed."))
+        .alias("sentence")
+    )
+    .drop(pl.col("META_2"))
+    .unique()
+)
 
-        date_str = datetime.strftime(pd.Timestamp(date), "%Y-%m-%d")
-        note_lines.append(f"On {date_str}, the patient had the following records:")
+# ----------------------------------------------------------------------------
+# Daily summaries: "On <date>, the patient had the following records: ..."
+# ----------------------------------------------------------------------------
+day_grouped_df = (
+    sentences_df.group_by("PatientID", "META_1", "EventDate")
+      .agg([
+        pl.col("sentence").str.concat(" ").alias("day_summary")
+        , pl.col("EventDate").first().alias("date")
+      ])
+      .with_columns(
+        pl.format("On {}, the patient had the following records: {}", pl.col("date"), pl.col("day_summary"))
+        .alias("day_summary")
+      )
+)
 
-        for _, row in group.iterrows():
-            dt, cat, num = row['DataType'], row['DataCategory'], row['DataNumeric']
-            if dt == "Diagnosis":
-                icd_code = str(cat).replace(".", "")
-                icd_title = icd_map.get(icd_code, "Unknown condition")
-                note_lines.append(f"  - ICD-10 code {cat}: {icd_title}")
-            elif dt == "Medication":
-                note_lines.append(f"  - Medication administered: {cat}")
-            elif dt == "Procedure":
-                note_lines.append(f"  - Procedure performed: {cat}")
-            else:
-                note_lines.append(f"  - {dt}: {cat}")
+# ----------------------------------------------------------------------------
+# Encounter pseudo-notes (one per PatientID, META_1); emb_id = order within patient
+# ----------------------------------------------------------------------------
+enc_grouped_df = (
+    day_grouped_df.group_by("PatientID", "META_1")
+        .agg([
+            pl.col("day_summary").str.concat("\n").alias("enc_summary")
+            , pl.col("EventDate").min().alias("date")
+            , pl.col("META_1").first().alias("enc_id")
+            , pl.col("PatientID").first().replace(demographic_map, default="Demographics not available.").alias("demographic_string")
+        ])
+        .with_columns(
+            pl.format("Encounter {} starting {}. {} {}", pl.col("enc_id"), pl.col("date"), pl.col("demographic_string"), pl.col("enc_summary")).alias("enc_summary")
+        )
+    .drop("demographic_string")
+    .sort("PatientID", "date")
+    .with_columns(pl.int_range(pl.len()).over("PatientID").alias("emb_id"))
+)
 
-            if row['is_gfr']:
-                try:
-                    gfr_candidate = float(num)
-                    if gfr is None:
-                        gfr = gfr_candidate
-                except Exception:
-                    continue
+# ----------------------------------------------------------------------------
+# Metadata export. ckd_icd_df is at event grain, so an encounter with several
+# N18 events gets several rows here (and several embeddings below).
+# ----------------------------------------------------------------------------
+enc_grouped_df = enc_grouped_df.join(
+    ckd_icd_df.select(["PatientID", "META_1", "CKD_stage_numeric", "max_stage"])
+    , on=["PatientID", "META_1"], how='left'
+)
+enc_grouped_df.write_csv(os.path.join(output_dir, "meta_v3_all.csv"), separator="$")
+print("Saved meta df")
+enc_grouped_df.drop("enc_summary").write_csv(os.path.join(output_dir, "meta_v3.csv"), separator="$")
+print("Saved meta df clean")
 
-        full_note = "\n".join(note_lines)
-        records.append({'PatientID': pid, 'EventDate': date, 'text': full_note, 'GFR': gfr})
+# ----------------------------------------------------------------------------
+# ClinicalBERT CLS embeddings, saved per patient as <PatientID>/<PatientID>.npy
+# ----------------------------------------------------------------------------
+print(f"[INFO] Loading model from: {model_name}")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
+device = f"cuda:{cuda_num}"
+model.to(device)
+model.eval()
 
-    summary_df = pd.DataFrame(records)
-    print(f"[INFO] Generated {len(summary_df)} synthetic patient-day notes.")
-    return summary_df
-
-def forward_fill_ckd_stage(summary_df):
-    """
-    For each patient, forward-fill the GFR values (sorted by date), and map them to CKD stages
-    based on the following thresholds:
-    
-        Stage 1: eGFR ≥ 90
-        Stage 2: 60 ≤ eGFR < 90
-        Stage 3a: 45 ≤ eGFR < 60
-        Stage 3b: 30 ≤ eGFR < 45
-        Stage 4: 15 ≤ eGFR < 30
-        Stage 5: eGFR < 15
-    
-    The stage is forced to be non-decreasing (i.e. if a new reading would lead to an improvement,
-    the previous worse stage is retained).
-    """
-    summary_df = summary_df.sort_values(by=["PatientID", "EventDate"]).copy()
-    # Convert GFR to numeric (if not already) and forward fill per patient.
-    summary_df["GFR"] = pd.to_numeric(summary_df["GFR"], errors="coerce")
-    summary_df["GFR"] = summary_df.groupby("PatientID")["GFR"].ffill()
-    
-    def gfr_to_stage(gfr):
-        if pd.isna(gfr):
-            return None, 0
-        if gfr >= 90:
-            return "1", 1
-        elif gfr >= 60:
-            return "2", 2
-        elif gfr >= 45:
-            return "3a", 3.1
-        elif gfr >= 30:
-            return "3b", 3.2
-        elif gfr >= 15:
-            return "4", 4
-        else:
-            return "5", 5
-
-    # For each patient, enforce non-decreasing (progressive) stage.
-    new_stages = {}
-    for pid, group in summary_df.groupby("PatientID"):
-        group = group.sort_values("EventDate")
-        max_stage_rank = 0
-        for idx, row in group.iterrows():
-            computed_stage, rank = gfr_to_stage(row["GFR"])
-            # If the computed stage is less severe than the worst seen so far, retain the worst.
-            if rank < max_stage_rank:
-                final_stage = new_stages.get(prev_idx, computed_stage)
-            else:
-                final_stage = computed_stage
-                max_stage_rank = rank
-            new_stages[idx] = final_stage
-            prev_idx = idx
-    summary_df["CKD_stage"] = summary_df.index.map(new_stages)
-    return summary_df
-
-def load_embedding_model(model_name, device):
-    print(f"[INFO] Loading model from: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-    return tokenizer, model
 
 def get_cls_embeddings(texts, tokenizer, model, device, embed_dim):
+    """CLS vector of the last hidden layer, truncated/zero-padded to embed_dim."""
     inputs = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
@@ -183,62 +260,19 @@ def get_cls_embeddings(texts, tokenizer, model, device, embed_dim):
         cls_emb = torch.nn.functional.pad(cls_emb, (0, pad), value=0)
     return cls_emb.cpu().numpy()
 
-def generate_and_save_embeddings(summary_df, tokenizer, model, device, embed_dim, batch_size, output_dir):
-    meta = []
-    texts = summary_df['text'].tolist()
-    ids = list(zip(summary_df['PatientID'], summary_df['EventDate']))
-    gfrs = summary_df['GFR'].tolist()
 
-    for i in tqdm(range(0, len(texts), batch_size), desc="Encoding notes in batches"):
-        batch_texts = texts[i:i+batch_size]
-        batch_ids = ids[i:i+batch_size]
-        batch_gfrs = gfrs[i:i+batch_size]
+patient_grouped_df = (
+    enc_grouped_df.sort(["PatientID", "emb_id"])
+        .group_by("PatientID")
+        .agg(pl.col("enc_summary").alias("pseudonotes"))
+)
+grouped_dict = dict(zip(patient_grouped_df["PatientID"], patient_grouped_df["pseudonotes"]))
+print("Generating embeddings")
+for pid, texts in tqdm(grouped_dict.items()):
+    patient_folder = os.path.join(output_dir, str(pid))
+    os.makedirs(patient_folder, exist_ok=True)
 
-        emb = get_cls_embeddings(batch_texts, tokenizer, model, device, embed_dim)
-
-        for (pid, date), gfr_val, vec in zip(batch_ids, batch_gfrs, emb):
-            # Create a folder for the patient if it doesn't exist.
-            patient_folder = os.path.join(output_dir, str(pid))
-            os.makedirs(patient_folder, exist_ok=True)
-
-            date_str = pd.to_datetime(date).strftime('%Y%m%d')
-            fname = f"{pid}_{date_str}.npz"
-            fpath = os.path.join(patient_folder, fname)
-            np.savez_compressed(fpath, cls_embedding=vec)
-            # Look up the CKD stage from the summary dataframe.
-            stage_val = summary_df[(summary_df['PatientID'] == pid) & (summary_df['EventDate'] == date)]['CKD_stage'].values[0]
-            meta.append({
-                'PatientID': pid,
-                'EventDate': date,
-                'GFR': gfr_val,
-                'CKD_stage': stage_val,
-                'text': summary_df[(summary_df['PatientID'] == pid) & (summary_df['EventDate'] == date)]['text'].values[0],
-                'embedding_file': os.path.join(str(pid), fname)
-            })
-
-    meta_df = pd.DataFrame(meta)
-    meta_csv_path = os.path.join(output_dir, 'patient_embedding_metadata.csv')
-    meta_df.to_csv(meta_csv_path, index=False)
-    print(f"[DONE] Metadata saved to: {meta_csv_path}")
-
-def main():
-    args = parse_arguments()
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    df, icd_map = load_data(args.csv, args.icd)
-    demographic_map = build_demographic_map(df)
-    print("Demographic mapping:")
-    print(demographic_map)
-
-    summary_df = generate_synthetic_notes(df, demographic_map, icd_map)
-    # Forward-fill GFR values and compute CKD stage per patient
-    summary_df = forward_fill_ckd_stage(summary_df)
-    print(summary_df.head())
-
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    tokenizer, model = load_embedding_model(args.model_name, device)
-    generate_and_save_embeddings(summary_df, tokenizer, model, device,
-                                 args.embed_dim, args.batch_size, args.output_dir)
-
-if __name__ == '__main__':
-    main()
+    embeddings = [get_cls_embeddings(t, tokenizer, model, device, embed_dim) for t in texts]
+    fname = f"{pid}"
+    fpath = os.path.join(patient_folder, fname)
+    np.save(fpath, np.array(embeddings).squeeze())
