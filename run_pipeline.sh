@@ -9,12 +9,10 @@
 #   train_embed  embedding sequence models + DeepSurv       ckd_prediction.py
 #   train_tab    tabular XGBoost baseline                   xgboost_baseline.py
 #   patient      patient-level sampling of test outputs     patient_sampling.py
-#   eval_clf     bootstrap classification metrics           eval_classification.py
-#   eval_surv    bootstrap survival metrics                 eval_tte.py
 #
-# Input/output paths for embed, tab, patient, eval_clf and eval_surv are set in
-# the configuration block at the top of each script (preset_modifier for the
-# evaluation scripts). The two training scripts take the CLI flags below.
+# Input/output paths for embed, tab and patient are set in the configuration
+# block at the top of each script. The two training scripts take the CLI flags
+# below.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p log_files pt_files joblib_files results_logs
@@ -72,16 +70,8 @@ case "$step" in
     python patient_sampling.py
     ;;
 
-  eval_clf)
-    python eval_classification.py
-    ;;
-
-  eval_surv)
-    python eval_tte.py
-    ;;
-
   *)
-    sed -n '2,17p' "$0"
+    sed -n '2,15p' "$0"
     exit 1
     ;;
 esac
