@@ -53,27 +53,24 @@ def paths(base, dirs):
 
 # ---- naming convention: <ckd|eskd|ckd_eskd>_<clf|surv>_event_<full|subset> ----
 presets = {
-    "ckd_eskd_clf_event_full": {
-        "fp": f"./{ckd_event_full}", "modifier": "classification",
-        "filepaths": paths(ckd_event_full, ckd_clf_dirs) + paths(eskd_event_full, eskd_event_dirs),
-    },
-    "ckd_clf_event_full": {
-        "fp": f"./{ckd_event_full}", "modifier": "classification",
-        "filepaths": paths(ckd_event_full, ckd_clf_dirs),
-    },
-    "ckd_surv_event_full": {
-        "fp": f"./{ckd_event_full}", "modifier": "deepsurv",
-        "filepaths": paths(ckd_event_full, ckd_surv_dirs),
-    },
+    # main models
+    "ckd_event_full": {
+            "fp": f"./{ckd_event_full}",
+            "filepaths": paths(ckd_event_full, ckd_clf_dirs + ckd_surv_dirs),
+        },
+    
+    # baseline
     "eskd_clf_event_full": {
         "fp": f"./{eskd_event_full}", "modifier": "classification",
         "filepaths": paths(eskd_event_full, eskd_event_dirs),
     },
 
     
+    
 }
 
 # ==== EDIT TO SWITCH RUNS ====
+# preset_modifier = "ckd_event_full"
 preset_modifier = "eskd_clf_event_full"
 
 RANDOM_SEED = 42  # for the random encounter picked for non-progressing patients
@@ -81,22 +78,13 @@ np.random.seed(RANDOM_SEED)
 
 preset = presets[preset_modifier]
 fp = preset["fp"]
-modifier = preset["modifier"]
 filepaths = preset["filepaths"]
 
 print("preset: ", preset_modifier)
 print("fp:      ", fp)
-print("modifier:", modifier)
 print("filepaths:")
 for p in filepaths:
     print("  ", p)
-
-# ----------------------------------------------------------------------------
-# Load the test outputs (embedding models write EncounterDate, XGBoost EventDate)
-# ----------------------------------------------------------------------------
-test_meta = pd.read_csv(filepaths[0])
-test_meta = test_meta.rename(columns={'EventDate': 'date', 'EncounterDate': 'date'})
-print("patients:", len(test_meta['PatientID'].unique()))
 
 
 def select_encounters(df):
@@ -130,15 +118,22 @@ def select_encounters(df):
     return result_df
 
 
-test_meta = select_encounters(test_meta)
-print("patients after sampling:", len(test_meta['PatientID'].unique()), "rows:", len(test_meta))
-
 # ----------------------------------------------------------------------------
 # Save to <training output dir>_patient_level/<same file name>
 # ----------------------------------------------------------------------------
 output_dir = os.path.dirname(filepaths[0]) + "_patient_level"
 os.makedirs(output_dir, exist_ok=True)
 
-new_path = os.path.join(output_dir, os.path.basename(filepaths[0]))
-test_meta.to_csv(new_path)
-print("saved:", new_path)
+
+read_paths = {os.path.abspath(p) for p in filepaths}
+
+for path in filepaths:
+    # same filename as the input, just in the patient-level folder
+    new_path = os.path.join(output_dir, os.path.basename(path))
+    assert os.path.abspath(new_path) not in read_paths, f"would overwrite an input file: {new_path}"
+
+    df = pd.read_csv(path).rename(columns={'EventDate': 'date'})
+    np.random.seed(42)
+    df = select_encounters(df)
+    df.to_csv(new_path)
+    print(path, "->", new_path, f"({len(df)} patients)")

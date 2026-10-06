@@ -68,7 +68,9 @@ bash run_pipeline.sh train_tab
 
 ### `patient_sampling.py`: Patient-Level Test Sets
 
-This script reduces the per-encounter test outputs to one test encounter per patient. For patients whose stage increases, it keeps the encounter just before their last increase; for all other patients, it keeps a random encounter (seed 42, `RANDOM_SEED`). 
+This script samples the per-encounter test outputs to one test encounter per patient. For patients whose stage increases, it keeps the encounter just before their last increase; for all other patients, it keeps a random encounter (seed 42, `RANDOM_SEED`). 
+
+Each run samples every file of one preset. The script must be run once per preset to build all the patient-level test sets. Edit `preset_modifier` at the top of the script between runs:
 
 **Usage:**
 ```bash
