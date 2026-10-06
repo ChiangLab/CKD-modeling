@@ -77,6 +77,22 @@ bash run_pipeline.sh patient
 
 ---
 
+### (placeholder) `patient_similarity.py`: Patient-Like-Me kNN and Patient Similarity Output
+
+This script builds one representation per patient from the stage 3 encounter embeddings produced by `embeddings.py` and estimates progression risk from each patient's most similar patients.
+
+It supports training and evaluation of the following models:
+- Cosine k-nearest-neighbor (kNN) retrieval over mean and mean-max pooled embeddings, with and without NNMF
+- Random forest classifier as a supervised reference
+
+
+**Usage:**
+```bash
+bash run_pipeline.sh similarity
+```
+---
+
+
 ### Metadata Format and Embedding Structure
 
 The script `embeddings.py` produces a metadata CSV file named `meta_v3.csv`. Each row in the file corresponds to a single patient-encounter pair and contains the following fields:
